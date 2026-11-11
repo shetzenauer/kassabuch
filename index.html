@@ -230,7 +230,7 @@ textarea.inp{height:auto;min-height:70px;padding:12px 14px;resize:vertical}
 'use strict';
 /* ================= Grundlagen ================= */
 const KEY = 'kassabuch-v1';
-const VERSION = '1.1';
+const VERSION = '1.2';
 const CATS0 = [['Lebensmittel','🛒'],['Drogerie','🧴'],['Haushalt','🏠'],['Tierbedarf','🐾'],['Tanken','⛽'],['Essen gehen','🍽️'],['Freizeit','🎉'],['Sonstiges','📦']];
 const SHOPS0 = ['Billa','Spar','Mpreis','Hofer','Lidl','dm','Bipa'];
 const MON = ['Jänner','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'];
@@ -902,7 +902,8 @@ function renderEditor() {
   if (E.receipt) {
     const r = E.receipt;
     const vat = r.rates ? [['20 %', r.rates[0]], ['10 %', r.rates[1]], ['13 %', r.rates[2]], ['0 %', r.rates[3]], ['19 %', r.rates[4]]].filter((x) => x[1]).map((x) => x[0] + ': ' + eur(x[1])).join(' · ') : '';
-    h += `<div class="rcpt ${r.storno || r.training ? 'warn' : ''}">🧾 Gescannter Beleg · Kasse ${esc(r.kid)} · Nr. ${esc(r.nr)} · ${esc(r.time || '')} Uhr${vat ? '<br>' + vat : ''}${r.storno ? '<br><b>Achtung: Stornobeleg</b>' : ''}${r.training ? '<br><b>Achtung: Trainingsbeleg</b>' : ''}${r.amount !== undefined && amt !== null && r.amount !== amt ? '<br>Betrag laut Beleg: ' + eur(r.amount) : ''}</div>`;
+    if (r.barcode) h += `<div class="rcpt">🧾 Strichcode vom Bon · Filiale/Kasse ${esc(r.kid)} · Bon ${esc(r.nr)}<br>Der Betrag steht nicht im Strichcode.</div>`;
+    else h += `<div class="rcpt ${r.storno || r.training ? 'warn' : ''}">🧾 Gescannter Beleg · Kasse ${esc(r.kid)} · Nr. ${esc(r.nr)} · ${esc(r.time || '')} Uhr${vat ? '<br>' + vat : ''}${r.storno ? '<br><b>Achtung: Stornobeleg</b>' : ''}${r.training ? '<br><b>Achtung: Trainingsbeleg</b>' : ''}${r.amount !== undefined && amt !== null && r.amount !== amt ? '<br>Betrag laut Beleg: ' + eur(r.amount) : ''}</div>`;
   }
   if (E.id) h += `<div class="btnrow" style="margin-top:22px"><button class="btn ghost" data-e="dup">Kopieren</button><button class="btn danger" data-e="del">Löschen</button></div>`;
   h += `</div><div class="foot"><button class="btn sec2" data-e="close">Abbrechen</button><button class="btn" data-e="save">Speichern</button></div>`;
@@ -993,7 +994,9 @@ async function openScanner() {
     const fm = await BarcodeDetector.getSupportedFormats();
     if (!fm.includes('qr_code')) { info('QR-Erkennung ist auf diesem Gerät nicht verfügbar.'); return; }
   } catch (e) {}
-  detector = new BarcodeDetector({ formats: ['qr_code'] });
+  let fmts = ['qr_code'];
+  try { const sup = await BarcodeDetector.getSupportedFormats(); fmts = ['qr_code', 'code_128', 'itf', 'code_39', 'ean_13'].filter((f) => sup.includes(f)); } catch (e) {}
+  detector = new BarcodeDetector({ formats: fmts });
   $('#scanner').hidden = false;
   $('#scanStatus').textContent = 'QR-Code auf der Rechnung in den Rahmen halten';
   $('#scanTorch').hidden = true; torchOn = false;
@@ -1014,7 +1017,7 @@ async function scanLoop() {
   if (!scanning) return;
   const v = $('#scanVideo');
   if (v.readyState >= 2) {
-    try { const codes = await detector.detect(v); if (codes.length && scanning) { handleCode(codes[0].rawValue); return; } } catch (e) {}
+    try { const codes = await detector.detect(v); if (codes.length && scanning) { handleCode(pickCode(codes)); return; } } catch (e) {}
   }
   setTimeout(scanLoop, 120);
 }
@@ -1036,11 +1039,37 @@ function categoryFromVat(rates) {
   if (Math.abs(n10) / tot >= 0.6 && has('Lebensmittel')) return 'Lebensmittel';
   return '';
 }
+/** Strichcode auf dem Bon (z. B. MPREIS): 3 Stellen Kennung, 4 Filiale, TTMMJJ, 3 Kasse, 6 Bon-Nr. – ohne Betrag */
+function parseBonBarcode(raw) {
+  const m = /^(\d{3})(\d{4})(\d{2})(\d{2})(\d{2})(\d{3})(\d{6})$/.exec(String(raw || '').trim());
+  if (!m) return null;
+  const [, pre, fil, dd, mm, yy, kas, bon] = m;
+  const y = 2000 + +yy, mo = +mm, d = +dd;
+  const dt = new Date(y, mo - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d || dt > new Date(Date.now() + 864e5) || y < 2017) return null;
+  return { kid: pre + '-' + fil + '/' + kas, nr: bon, key: 'bc:' + pre + fil, date: isoOf(dt), fil, kas, barcode: true };
+}
+/** Bei mehreren Codes im Bild: zuerst den Registrierkassen-QR-Code, dann einen Bon-Strichcode */
+function pickCode(codes) {
+  const raws = codes.map((c) => c.rawValue);
+  return raws.find((x) => parseRKSV(x)) || raws.find((x) => parseBonBarcode(x)) || raws[0];
+}
+async function openFromBarcode(bc) {
+  const dup = S.items.find((i) => i.receipt && i.receipt.kid === bc.kid && i.receipt.nr === bc.nr);
+  if (dup && !(await ask(`Dieser Bon ist schon erfasst (${dup.title}, ${fmtDate(dup.date, true)}, ${eur(dup.amount)}).\n\nTrotzdem nochmal erfassen?`, 'Trotzdem erfassen'))) { stopScanner(); return; }
+  $('#scanner').hidden = true;
+  const known = S.kassen[bc.key] || {};
+  openEditor(null, { date: bc.date, title: known.title || '', category: known.category || '', receipt: { kid: bc.kid, nr: bc.nr, key: bc.key, barcode: true } }, true);
+  setTimeout(() => { const a = $('#eAmount'); a && a.focus(); }, 150);
+  toast((known.title ? known.title + ' · ' : '') + 'Datum erkannt – Betrag eintippen');
+}
 async function handleCode(raw) {
   stopCamera();
   if (navigator.vibrate) navigator.vibrate(60);
   const r = parseRKSV(raw);
   if (!r) {
+    const bc = parseBonBarcode(raw);
+    if (bc) { openFromBarcode(bc); return; }
     $('#scanStatus').innerHTML = 'Das ist kein österreichischer Kassenbeleg-Code.<br><small>' + esc(String(raw).slice(0, 80)) + '</small>';
     setTimeout(() => { if (!$('#scanner').hidden) { $('#scanStatus').textContent = 'Nochmal versuchen …'; restartCamera(); } }, 2200);
     return;
@@ -1077,7 +1106,7 @@ $('#scanFile').addEventListener('change', async (e) => {
   try {
     const bmp = await createImageBitmap(f);
     const codes = await detector.detect(bmp);
-    if (codes.length) handleCode(codes[0].rawValue);
+    if (codes.length) handleCode(pickCode(codes));
     else $('#scanStatus').textContent = 'Kein QR-Code im Foto gefunden. Näher ran und scharf stellen.';
   } catch (err) { $('#scanStatus').textContent = 'Foto konnte nicht gelesen werden.'; }
 });
