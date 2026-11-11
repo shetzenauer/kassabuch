@@ -230,7 +230,7 @@ textarea.inp{height:auto;min-height:70px;padding:12px 14px;resize:vertical}
 'use strict';
 /* ================= Grundlagen ================= */
 const KEY = 'kassabuch-v1';
-const VERSION = '1.0';
+const VERSION = '1.1';
 const CATS0 = [['Lebensmittel','🛒'],['Drogerie','🧴'],['Haushalt','🏠'],['Tierbedarf','🐾'],['Tanken','⛽'],['Essen gehen','🍽️'],['Freizeit','🎉'],['Sonstiges','📦']];
 const SHOPS0 = ['Billa','Spar','Mpreis','Hofer','Lidl','dm','Bipa'];
 const MON = ['Jänner','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'];
@@ -350,8 +350,9 @@ function parseRKSV(raw) {
     rates.push(Math.round(parseFloat(x.replace(',', '.')) * 100));
   }
   const counter = p[10] || '';
+  const cert = p[11] || '';
   return {
-    kid, nr, ts, date: ts.slice(0, 10), time: ts.slice(11, 16),
+    kid, nr, ts, cert, key: kid + '|' + cert, date: ts.slice(0, 10), time: ts.slice(11, 16),
     amount: rates.reduce((a, b) => a + b, 0), rates,
     storno: counter === 'U1RP', training: counter === 'VFJB'
   };
@@ -900,7 +901,8 @@ function renderEditor() {
   h += `<label class="lbl">Notiz (optional)</label><textarea class="inp" id="eNote" rows="2" placeholder="z. B. Geburtstagsgeschenk">${esc(E.note)}</textarea>`;
   if (E.receipt) {
     const r = E.receipt;
-    h += `<div class="rcpt ${r.storno || r.training ? 'warn' : ''}">🧾 Gescannter Beleg · Kasse ${esc(r.kid)} · Nr. ${esc(r.nr)} · ${esc(r.time || '')} Uhr${r.storno ? '<br><b>Achtung: Stornobeleg</b>' : ''}${r.training ? '<br><b>Achtung: Trainingsbeleg</b>' : ''}${r.amount !== undefined && amt !== null && r.amount !== amt ? '<br>Betrag laut Beleg: ' + eur(r.amount) : ''}</div>`;
+    const vat = r.rates ? [['20 %', r.rates[0]], ['10 %', r.rates[1]], ['13 %', r.rates[2]], ['0 %', r.rates[3]], ['19 %', r.rates[4]]].filter((x) => x[1]).map((x) => x[0] + ': ' + eur(x[1])).join(' · ') : '';
+    h += `<div class="rcpt ${r.storno || r.training ? 'warn' : ''}">🧾 Gescannter Beleg · Kasse ${esc(r.kid)} · Nr. ${esc(r.nr)} · ${esc(r.time || '')} Uhr${vat ? '<br>' + vat : ''}${r.storno ? '<br><b>Achtung: Stornobeleg</b>' : ''}${r.training ? '<br><b>Achtung: Trainingsbeleg</b>' : ''}${r.amount !== undefined && amt !== null && r.amount !== amt ? '<br>Betrag laut Beleg: ' + eur(r.amount) : ''}</div>`;
   }
   if (E.id) h += `<div class="btnrow" style="margin-top:22px"><button class="btn ghost" data-e="dup">Kopieren</button><button class="btn danger" data-e="del">Löschen</button></div>`;
   h += `</div><div class="foot"><button class="btn sec2" data-e="close">Abbrechen</button><button class="btn" data-e="save">Speichern</button></div>`;
@@ -964,7 +966,7 @@ function saveEditor() {
     if (!person(E.payer)) { toast('Bitte auswählen, wer bezahlt hat'); return; }
     Object.assign(rec, { title, category: E.category || guessCategory(title) || 'Sonstiges', payer: E.payer, participants: E.participants.slice(), receipt: E.receipt || null });
     S.lastPayer = E.payer;
-    if (rec.receipt && rec.receipt.kid) S.kassen[rec.receipt.kid] = { title, category: rec.category };
+    if (rec.receipt && rec.receipt.kid) S.kassen[rec.receipt.key || rec.receipt.kid] = { title, category: rec.category };
   } else {
     if (!person(E.from) || !person(E.to) || E.from === E.to) { toast('Bitte zwei verschiedene Personen wählen'); return; }
     if (amt < 0) { toast('Der Betrag muss positiv sein'); return; }
@@ -1025,6 +1027,15 @@ function stopScanner(fromPop) {
   stopCamera(); $('#scanner').hidden = true;
   if (!fromPop) popOverlay();
 }
+/** Kategorie-Vorschlag aus den Steuersätzen: überwiegend 10 % = Lebensmittel */
+function categoryFromVat(rates) {
+  if (!rates) return '';
+  const n10 = rates[1];
+  const tot = rates.reduce((a, b) => a + Math.abs(b), 0) || 1;
+  const has = (name) => S.categories.some((c) => c.name === name);
+  if (Math.abs(n10) / tot >= 0.6 && has('Lebensmittel')) return 'Lebensmittel';
+  return '';
+}
 async function handleCode(raw) {
   stopCamera();
   if (navigator.vibrate) navigator.vibrate(60);
@@ -1034,14 +1045,14 @@ async function handleCode(raw) {
     setTimeout(() => { if (!$('#scanner').hidden) { $('#scanStatus').textContent = 'Nochmal versuchen …'; restartCamera(); } }, 2200);
     return;
   }
-  const dup = S.items.find((i) => i.receipt && i.receipt.kid === r.kid && i.receipt.nr === r.nr);
+  const dup = S.items.find((i) => i.receipt && i.receipt.kid === r.kid && i.receipt.nr === r.nr && (!i.receipt.cert || i.receipt.cert === r.cert));
   if (dup && !(await ask(`Dieser Beleg ist schon erfasst (${dup.title}, ${fmtDate(dup.date, true)}, ${eur(dup.amount)}).\n\nTrotzdem nochmal erfassen?`, 'Trotzdem erfassen'))) { stopScanner(); return; }
   $('#scanner').hidden = true;
-  const known = S.kassen[r.kid] || {};
+  const known = S.kassen[r.key] || S.kassen[r.kid] || {};
   openEditor(null, {
     date: r.date, amount: r.amount, amountStr: num(r.amount),
-    title: known.title || '', category: known.category || '',
-    receipt: { kid: r.kid, nr: r.nr, ts: r.ts, time: r.time, amount: r.amount, storno: r.storno, training: r.training }
+    title: known.title || '', category: known.category || categoryFromVat(r.rates),
+    receipt: { kid: r.kid, cert: r.cert, key: r.key, nr: r.nr, ts: r.ts, time: r.time, amount: r.amount, rates: r.rates, storno: r.storno, training: r.training }
   }, true);
   if (!known.title) setTimeout(() => { const t = $('#eTitle'); t && t.focus(); }, 150);
   toast(known.title ? `Erkannt: ${known.title} · ${eur(r.amount)}` : `Beleg erkannt: ${eur(r.amount)} – Geschäft wählen`);
